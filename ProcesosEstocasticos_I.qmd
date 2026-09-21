@@ -1,0 +1,427 @@
+---
+title: "Procesos Estocasticos I"
+author: "Noe Ramirez"
+format: html
+editor: visual
+---
+
+```{r}
+# Procesos Estocasticos I - MIT 18.S096 (Topics in Mathematics with Applications in Finance)
+
+# Modelos:
+# 1. Caminata aleatoria simple con drift
+# 2. Caminata aleatoria geometrica
+# 3. Cadena de Markov de 3 estados
+
+# CONFIGURACIÓN  (lo único que necesitas modificar)
+ticker     <- "NVDA"                      # Ticker de Yahoo Finance
+end_date   <- Sys.Date()                  # Hasta hoy
+start_date <- end_date - 365 * 4          # Últimos 4 años
+
+# Parámetros avanzados 
+n_sim         <- 2000    # [4] Nº de trayectorias simuladas (antes 50; ahora suficiente
+                          #     para que el error estándar de la media sea razonable)
+horizon       <- 126     # Horizonte de simulación en días hábiles (~6 meses)
+markov_days   <- 30      # Días a simular en la cadena de Markov
+seed          <- 123     # Semilla para reproducibilidad
+trading_days  <- 252     # Días hábiles por año (para anualizar)
+umbral_metodo <- "sigma" # [1] "sigma" (k*sigma) o "cuantil" (terciles empíricos)
+k_sigma       <- 0.5     # usado si umbral_metodo == "sigma": +/- 0.5*sigma diaria
+n_sim_conv    <- c(50, 100, 250, 500, 1000, 2000)  # [4] tamaños para el estudio de convergencia
+
+# i. LIBRERÍAS 
+paquetes <- c("quantmod", "ggplot2")
+for (p in paquetes) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, dependencies = TRUE)
+  suppressPackageStartupMessages(library(p, character.only = TRUE))
+}
+set.seed(seed)
+
+# ii. OBTENCIÓN Y PREPARACIÓN DE DATOS
+precios_xts <- tryCatch(
+  Ad(getSymbols(ticker, src = "yahoo", from = start_date, to = end_date,
+                auto.assign = FALSE)),
+  error = function(e) stop("No se pudieron descargar datos de '", ticker,
+                           "'. Verifica el ticker y tu conexión.\n", e$message)
+)
+n_na <- sum(is.na(precios_xts))
+precios_xts <- na.omit(precios_xts)
+
+fechas <- index(precios_xts)
+p      <- as.numeric(precios_xts)
+n      <- length(p)
+P0     <- p[n]                 # Último precio observado: punto de partida
+fecha0 <- fechas[n]
+
+# --- Retornos logarítmicos:  r_t = ln(P_t / P_{t-1}) ---
+r        <- diff(log(p))
+fechas_r <- fechas[-1]
+
+# --- Estimadores empíricos (diarios) ---
+mu    <- mean(r)
+sigma <- sd(r)
+
+cat("\n==============================================================\n")
+cat(sprintf(" ESTADÍSTICAS DESCRIPTIVAS  -  %s\n", ticker))
+cat("==============================================================\n")
+cat(sprintf(" Periodo             : %s  a  %s\n", format(min(fechas)), format(max(fechas))))
+cat(sprintf(" Nº de observaciones : %d precios / %d retornos (NAs eliminados: %d)\n",
+            n, length(r), n_na))
+cat(sprintf(" Último precio (P0)  : %.2f\n", P0))
+cat(sprintf(" mu    (diaria)      : %+.6f  (%.4f%%)\n", mu, 100 * mu))
+cat(sprintf(" sigma (diaria)      : %.6f  (%.4f%%)\n", sigma, 100 * sigma))
+cat(sprintf(" mu    (anualizada)  : %+.4f  (%.2f%%)\n", mu * trading_days, 100 * mu * trading_days))
+cat(sprintf(" sigma (anualizada)  : %.4f  (%.2f%%)   [sigma*sqrt(%d)]\n",
+            sigma * sqrt(trading_days), 100 * sigma * sqrt(trading_days), trading_days))
+cat(sprintf(" Retorno mín / máx   : %.2f%% / %.2f%%\n", 100 * min(r), 100 * max(r)))
+cat("==============================================================\n")
+
+# --- Fechas futuras (solo días hábiles, lun-vie) para los gráficos ---
+fut_all   <- fecha0 + seq_len(horizon * 2)
+fut_dates <- fut_all[!format(fut_all, "%u") %in% c("6", "7")][seq_len(horizon)]
+sim_dates <- c(fecha0, fut_dates)
+
+hist_df <- data.frame(date = fechas, price = p)
+
+paths_to_long <- function(M, dates, model) {
+  data.frame(date  = rep(dates, each = nrow(M)),
+             path  = rep(seq_len(nrow(M)), times = ncol(M)),
+             price = as.vector(M),
+             model = model)
+}
+
+# iii. Gráfico con bandas de percentiles 5%-95%, además de media y trayectorias
+plot_simulacion <- function(hist_df, long_df, titulo, subtitulo, color, n_paths_draw = 60) {
+  # media y percentiles por fecha
+  resumen_df <- aggregate(price ~ date, data = long_df,
+                           FUN = function(x) c(p05 = quantile(x, 0.05),
+                                                p50 = mean(x),
+                                                p95 = quantile(x, 0.95)))
+  resumen_df <- do.call(data.frame, resumen_df)
+  names(resumen_df) <- c("date", "p05", "media", "p95")
+
+  # dibujar solo una submuestra de trayectorias individuales para legibilidad
+  paths_disponibles <- unique(long_df$path)
+  paths_draw <- sample(paths_disponibles, min(n_paths_draw, length(paths_disponibles)))
+  long_draw <- long_df[long_df$path %in% paths_draw, ]
+
+  ggplot() +
+    geom_ribbon(data = resumen_df, aes(date, ymin = p05, ymax = p95),
+                fill = color, alpha = 0.15) +
+    geom_line(data = long_draw, aes(date, price, group = path),
+              colour = color, alpha = 0.20, linewidth = 0.35) +
+    geom_line(data = resumen_df, aes(date, media),
+              colour = "black", linetype = "dashed", linewidth = 0.9) +
+    geom_line(data = hist_df, aes(date, price),
+              colour = "black", linewidth = 0.8) +
+    geom_vline(xintercept = fecha0, linetype = "dotted", colour = "grey40") +
+    geom_hline(yintercept = 0, colour = "red", linewidth = 0.4) +
+    labs(title = titulo, subtitle = subtitulo, x = NULL, y = "Precio ajustado",
+         caption = "Banda sombreada = percentiles 5%-95% de la simulación MC") +
+    theme_minimal(base_size = 12)
+}
+
+# DIAGNÓSTICO DE SUPUESTOS SOBRE LOS LOG-RETORNOS
+cat("\n==============================================================\n")
+cat(" DIAGNÓSTICO DE SUPUESTOS (log-retornos)\n")
+cat("==============================================================\n")
+
+# Normalidad: Shapiro-Wilk (submuestra si n es muy grande, límite práctico ~5000)
+r_test <- if (length(r) > 5000) sample(r, 5000) else r
+sw <- shapiro.test(r_test)
+cat(sprintf(" Shapiro-Wilk (normalidad)   : W = %.4f, p-valor = %.4g\n", sw$statistic, sw$p.value))
+if (sw$p.value < 0.05) {
+  cat("   -> Se RECHAZA normalidad al 5%%. Los intervalos de confianza teóricos\n")
+  cat("      del GBM/SRW deben interpretarse con cautela (colas más pesadas que N(0,1)\n")
+  cat("      son típicas en retornos financieros).\n")
+} else {
+  cat("   -> No se rechaza normalidad al 5%%.\n")
+}
+
+# Autocorrelación: Ljung-Box sobre los retornos (lag=10, ajustable)
+lb <- Box.test(r, lag = 10, type = "Ljung-Box")
+cat(sprintf(" Ljung-Box (autocorrel., lag=10): X-cuadrado = %.4f, p-valor = %.4g\n",
+            lb$statistic, lb$p.value))
+if (lb$p.value < 0.05) {
+  cat("   -> Se RECHAZA independencia al 5%%. Hay autocorrelación significativa:\n")
+  cat("      el supuesto de shocks i.i.d. de SRW/GBM es una simplificación, no un\n")
+  cat("      hecho verificado para esta serie.\n")
+} else {
+  cat("   -> No se rechaza independencia (i.i.d.) al 5%%.\n")
+}
+
+qq_df <- data.frame(r = r)
+g_qq <- ggplot(qq_df, aes(sample = r)) +
+  stat_qq(colour = "#2C7FB8", alpha = 0.6) +
+  stat_qq_line(colour = "red") +
+  labs(title = "QQ-plot de los log-retornos vs. Normal",
+       subtitle = sprintf("Shapiro-Wilk p = %.4g | Ljung-Box(10) p = %.4g", sw$p.value, lb$p.value),
+       x = "Cuantiles teóricos N(0,1)", y = "Cuantiles muestrales") +
+  theme_minimal(base_size = 12)
+print(g_qq)
+
+# CAMINATA ALEATORIA SIMPLE CON DRIFT  (Simple Random Walk / ABM)
+# P_t = P_0 + sum(dP_i),  dP_i = drift_P + sigma_P*Z_i,  Z_i ~ N(0,1) i.i.d.
+# drift_P = mu*P0 ; sigma_P = sigma*P0  (linealización de los log-retornos
+# alrededor de P0; válida como aproximación de primer orden, no exacta).
+drift_P <- mu * P0
+sigma_P <- sigma * P0
+
+set.seed(seed)  # [6] semilla explícita antes de cada bloque de simulación
+Z_srw <- matrix(rnorm(n_sim * horizon), nrow = n_sim, ncol = horizon)
+dP    <- drift_P + sigma_P * Z_srw
+srw   <- P0 + t(apply(dP, 1, cumsum))
+srw   <- cbind(P0, srw)
+
+srw_long <- paths_to_long(srw, sim_dates, "SRW")
+
+g_srw <- plot_simulacion(
+  hist_df, srw_long,
+  titulo    = sprintf("Caminata aleatoria simple con drift - %s", ticker),
+  subtitulo = sprintf("%d trayectorias | P_t = P_0 + sum(dP_i) | drift=%.4f, sigma_P=%.4f/día (aprox. lineal)",
+                      n_sim, drift_P, sigma_P),
+  color = "#2C7FB8")
+print(g_srw)
+
+# CAMINATA ALEATORIA GEOMÉTRICA  (Geometric RW / GBM, discretización exacta)
+# ==============================================================================
+# P_t = P_0 * exp(mu_g*t + sigma*W_t),  W_t = sum(Z_i), dt = 1 día.
+# mu_g = mean(log-retornos) YA incorpora la corrección de Itô (-1/2 sigma^2);
+# no debe restarse de nuevo. mu_a = mu_g + sigma^2/2 es solo el drift aritmético
+# instantáneo implícito, mostrado como referencia (no se usa para simular).
+mu_g <- mu
+mu_a <- mu_g + sigma^2 / 2
+
+set.seed(seed)  # [6]
+Z_gbm <- matrix(rnorm(n_sim * horizon), nrow = n_sim, ncol = horizon)
+W     <- t(apply(Z_gbm, 1, cumsum))
+t_idx <- seq_len(horizon)
+gbm   <- P0 * exp(outer(rep(1, n_sim), mu_g * t_idx) + sigma * W)
+gbm   <- cbind(P0, gbm)
+
+gbm_long <- paths_to_long(gbm, sim_dates, "GBM")
+
+g_gbm <- plot_simulacion(
+  hist_df, gbm_long,
+  titulo    = sprintf("Caminata aleatoria geométrica (GBM) - %s", ticker),
+  subtitulo = sprintf("%d trayectorias | P_t = P_0 exp(mu_g t + sigma W_t) | mu_g=%.5f, sigma=%.5f/día",
+                      n_sim, mu_g, sigma),
+  color = "#31A354")
+print(g_gbm)
+
+cat("\n==============================================================\n")
+cat(sprintf(" COMPARACIÓN A %d DÍAS HÁBILES (P0 = %.2f)\n", horizon, P0))
+cat("==============================================================\n")
+resumen <- data.frame(
+  Modelo         = c("Random Walk simple (ABM)", "Random Walk geométrico (GBM)"),
+  Precio_medio   = c(mean(srw[, horizon + 1]), mean(gbm[, horizon + 1])),
+  Precio_p05     = c(quantile(srw[, horizon + 1], 0.05), quantile(gbm[, horizon + 1], 0.05)),
+  Precio_p95     = c(quantile(srw[, horizon + 1], 0.95), quantile(gbm[, horizon + 1], 0.95)),
+  Pct_tray_le_0  = c(100 * mean(apply(srw, 1, min) <= 0),
+                      100 * mean(apply(gbm, 1, min) <= 0))
+)
+print(format(resumen, digits = 5, nsmall = 2), row.names = FALSE)
+cat("(Pct_tray_le_0: % de trayectorias que tocaron precio <= 0. En el GBM siempre es 0.)\n")
+cat(sprintf(" Referencia: mu aritmético implícito = mu_g + sigma^2/2 = %.6f\n", mu_a))
+
+# ANÁLISIS DE CONVERGENCIA DE MONTE CARLO
+# Se estima el precio esperado a 'horizon' días con distintos tamaños de muestra n_sim, para verificar que la media simulada se estabiliza (Ley de los Grandes Números) y para cuantificar el error estándar de Monte Carlo.
+set.seed(seed)
+conv_resultados <- data.frame(n_sim = integer(), media = double(), se = double())
+Z_max <- matrix(rnorm(max(n_sim_conv) * horizon), nrow = max(n_sim_conv), ncol = horizon)
+for (ns in n_sim_conv) {
+  Zi <- Z_max[seq_len(ns), , drop = FALSE]
+  Wi <- t(apply(Zi, 1, cumsum))
+  gbm_i <- P0 * exp(mu_g * t_idx[horizon] + sigma * Wi[, horizon])
+  conv_resultados <- rbind(conv_resultados,
+                            data.frame(n_sim = ns, media = mean(gbm_i), se = sd(gbm_i) / sqrt(ns)))
+}
+cat("\n==============================================================\n")
+cat(" CONVERGENCIA MONTE CARLO (precio esperado GBM a horizon días)\n")
+cat("==============================================================\n")
+print(conv_resultados, row.names = FALSE)
+
+g_conv <- ggplot(conv_resultados, aes(n_sim, media)) +
+  geom_ribbon(aes(ymin = media - 1.96 * se, ymax = media + 1.96 * se),
+              fill = "#31A354", alpha = 0.2) +
+  geom_line(colour = "#31A354") +
+  geom_point(colour = "#31A354", size = 2) +
+  scale_x_log10() +
+  labs(title = "Convergencia de Monte Carlo (GBM)",
+       subtitle = "Media simulada del precio a horizon días vs. nº de trayectorias (banda = IC 95%)",
+       x = "n_sim (escala log)", y = "Precio medio simulado") +
+  theme_minimal(base_size = 12)
+print(g_conv)
+
+# 3(c). CADENA DE MARKOV  (3 estados)
+# P(X_{n+1}=j | X_n=i, X_{n-1}, ...) = P(X_{n+1}=j | X_n=i) = P_ij  (SUPUESTO,
+# no un hecho: más abajo se prueba formalmente si es razonable, sección 3c-bis).
+estados <- c("Baja", "Neutral", "Alta")
+
+# Discretización de retornos: umbral relativo a la volatilidad del activo, en vez de un valor absoluto fijo (que puede vaciar "Neutral" en activos muy volátiles o hacerlo casi todo "Neutral" en activos muy poco volátiles).
+if (umbral_metodo == "sigma") {
+  threshold <- k_sigma * sigma
+  desc_umbral <- sprintf("+/- %.2f*sigma_diaria = +/-%.4f%%", k_sigma, 100 * threshold)
+} else if (umbral_metodo == "cuantil") {
+  qs <- quantile(r, probs = c(1/3, 2/3))
+  desc_umbral <- sprintf("terciles empíricos: [%.4f%%, %.4f%%]", 100 * qs[1], 100 * qs[2])
+} else {
+  stop("umbral_metodo debe ser 'sigma' o 'cuantil'")
+}
+
+if (umbral_metodo == "sigma") {
+  estado_chr <- ifelse(r < -threshold, "Baja", ifelse(r > threshold, "Alta", "Neutral"))
+} else {
+  estado_chr <- ifelse(r < qs[1], "Baja", ifelse(r > qs[2], "Alta", "Neutral"))
+}
+estado <- factor(estado_chr, levels = estados)
+
+cat("\n==============================================================\n")
+cat(sprintf(" DISCRETIZACIÓN DE ESTADOS: método = '%s' (%s)\n", umbral_metodo, desc_umbral))
+cat("==============================================================\n")
+print(round(prop.table(table(estado)), 4))
+
+# Matriz de conteos y matriz de transición empírica (MLE), con suavizado de Laplace (add-alpha) opcional para evitar filas degeneradas de forma menos arbitraria que forzar 1/3 exacto.
+alpha_laplace <- 0.5   # [7] suavizado leve; alpha=0 recupera el MLE puro
+conteos <- table(Desde = estado[-length(estado)], Hacia = estado[-1])
+suma_filas <- rowSums(conteos)
+P <- matrix(0, 3, 3, dimnames = list(Desde = estados, Hacia = estados))
+for (i in seq_along(estados)) {
+  P[i, ] <- (conteos[i, ] + alpha_laplace) / (suma_filas[i] + 3 * alpha_laplace)
+  if (suma_filas[i] == 0) {
+    warning("El estado '", estados[i], "' no se observó; fila estimada solo por suavizado de Laplace.")
+  }
+}
+
+cat("\n Matriz de conteos n_ij:\n")
+print(conteos)
+cat(sprintf("\n Matriz de transición empírica P_ij (suavizado Laplace, alpha=%.1f):\n", alpha_laplace))
+print(round(P, 4))
+cat("\n Verificación (suma de filas = 1):", paste(round(rowSums(P), 6), collapse = " "), "\n")
+
+# Distribución estacionaria: pi P = pi
+eig <- eigen(t(P))
+v   <- Re(eig$vectors[, which.max(Re(eig$values))])
+pi_est <- setNames(v / sum(v), estados)
+cat("\n Distribución estacionaria (pi = pi P):\n")
+print(round(pi_est, 4))
+
+
+# PRUEBA FORMAL DE LA PROPIEDAD DE MARKOV (orden 1 vs. orden 2)
+# H0: el proceso es markoviano de orden 1  ->  P(X_{n+1}|X_n, X_{n-1}) = P(X_{n+1}|X_n)
+# H1: se necesita orden 2 (X_{n-1} aporta información adicional)
+#
+# Test de razón de verosimilitud (LR), comparando log-verosimilitud del modelo de orden 1 contra el de orden 2, con estadístico LR = 2*(logLik_orden2 - logLik_orden1) ~ chi^2_{gl} donde gl = (nº parámetros libres orden2) - (nº parámetros libres orden1).
+
+cat("\n==============================================================\n")
+cat(" PRUEBA DE LA PROPIEDAD DE MARKOV (orden 1 vs. orden 2)\n")
+cat("==============================================================\n")
+
+x <- as.character(estado)
+Tn <- length(x)
+
+# --- Log-verosimilitud bajo orden 1 (usa la matriz P ya estimada por MLE puro, sin suavizado, para que el test sea sobre el estimador estándar) ---
+conteos_o1 <- table(Desde = estado[-length(estado)], Hacia = estado[-1])
+sf_o1 <- rowSums(conteos_o1)
+P_mle <- matrix(0, 3, 3, dimnames = list(estados, estados))
+for (i in seq_along(estados)) {
+  if (sf_o1[i] > 0) P_mle[i, ] <- conteos_o1[i, ] / sf_o1[i]
+}
+loglik_o1 <- 0
+for (t in 2:Tn) {
+  pij <- P_mle[x[t - 1], x[t]]
+  if (pij > 0) loglik_o1 <- loglik_o1 + log(pij)
+}
+
+# --- Log-verosimilitud bajo orden 2: P(X_t | X_{t-1}, X_{t-2}) estimado por conteos de tripletas (i,j) -> k ---
+if (Tn >= 4) {
+  conteos_o2 <- table(Desde2 = x[1:(Tn - 2)], Desde1 = x[2:(Tn - 1)], Hacia = x[3:Tn])
+  loglik_o2 <- 0
+  gl_o2_libres <- 0
+  for (i in estados) for (j in estados) {
+    sub <- conteos_o2[i, j, ]
+    nij <- sum(sub)
+    if (nij > 0) {
+      gl_o2_libres <- gl_o2_libres + (sum(sub > 0) - 1)  # aporta a los grados de libertad
+      for (k in estados) {
+        if (sub[k] > 0) loglik_o2 <- loglik_o2 + sub[k] * log(sub[k] / nij)
+      }
+    }
+  }
+  # grados de libertad: parámetros libres de orden2 (hasta 3*(3-1)=6 por cada
+  # uno de los 3 estados "desde-2", es decir hasta 18) menos los de orden1 (6)
+  gl <- 3 * 3 * (3 - 1) - 3 * (3 - 1)   # = 18 - 6 = 12 (cota superior teórica)
+  LR <- 2 * (loglik_o2 - loglik_o1)
+  p_valor_markov <- 1 - pchisq(LR, df = gl)
+
+  cat(sprintf(" log-verosimilitud orden 1        : %.4f\n", loglik_o1))
+  cat(sprintf(" log-verosimilitud orden 2        : %.4f\n", loglik_o2))
+  cat(sprintf(" Estadístico LR                   : %.4f\n", LR))
+  cat(sprintf(" Grados de libertad (cota superior): %d\n", gl))
+  cat(sprintf(" p-valor (chi^2)                  : %.4g\n", p_valor_markov))
+  if (!is.na(p_valor_markov) && p_valor_markov < 0.05) {
+    cat("  -> Se RECHAZA H0 al 5%%: hay evidencia de que el orden 1 es insuficiente\n")
+    cat("     (el estado en t-2 aporta información sobre t). La matriz P de orden 1\n")
+    cat("     debe interpretarse como una APROXIMACIÓN, no como el proceso verdadero.\n")
+  } else {
+    cat("  -> No se rechaza H0 al 5%%: el supuesto de Markov de orden 1 es razonable\n")
+    cat("     para esta serie y esta discretización.\n")
+  }
+  cat("  NOTA: los grados de libertad reportados son una cota superior conservadora\n")
+  cat("  (algunas celdas con conteo 0 reducen los g.l. efectivos); interpretar el\n")
+  cat("  p-valor como orientativo, no como una prueba exacta de manual.\n")
+} else {
+  cat(" Muestra insuficiente para la prueba de orden 2.\n")
+}
+
+# Simulación de una trayectoria futura de estados
+set.seed(seed)  # [6]
+estado_actual <- as.character(estado[length(estado)])
+trayectoria    <- character(markov_days + 1)
+trayectoria[1] <- estado_actual
+for (kk in seq_len(markov_days)) {
+  trayectoria[kk + 1] <- sample(estados, size = 1, prob = P[trayectoria[kk], ])
+}
+
+cat(sprintf("\n Estado actual (último día observado): %s\n", estado_actual))
+cat(sprintf(" Trayectoria simulada de %d días:\n", markov_days))
+print(trayectoria[-1])
+cat("\n Frecuencia de estados en la trayectoria simulada:\n")
+print(round(prop.table(table(factor(trayectoria[-1], levels = estados))), 4))
+
+mat_pow <- function(M, k) { R <- diag(nrow(M)); for (i in seq_len(k)) R <- R %*% M; R }
+Pk <- mat_pow(P, markov_days)
+dimnames(Pk) <- dimnames(P)
+cat(sprintf("\n Probabilidades a %d pasos desde '%s' (fila de P^%d):\n",
+            markov_days, estado_actual, markov_days))
+print(round(Pk[estado_actual, ], 4))
+
+mk_df <- data.frame(dia = 0:markov_days,
+                    estado = factor(trayectoria, levels = estados))
+g_markov <- ggplot(mk_df, aes(dia, as.integer(estado))) +
+  geom_step(colour = "grey40") +
+  geom_point(aes(colour = estado), size = 3) +
+  scale_y_continuous(breaks = 1:3, labels = estados) +
+  scale_colour_manual(values = c(Baja = "#D7301F", Neutral = "#969696", Alta = "#238B45")) +
+  labs(title = sprintf("Cadena de Markov: trayectoria simulada de %d días - %s", markov_days, ticker),
+       subtitle = sprintf("Día 0 = estado actual (%s) | umbral: %s", estado_actual, desc_umbral),
+       x = "Días hacia adelante", y = "Estado", colour = "Estado") +
+  theme_minimal(base_size = 12)
+print(g_markov)
+
+P_df <- as.data.frame(as.table(P))
+names(P_df) <- c("Desde", "Hacia", "Prob")
+g_heat <- ggplot(P_df, aes(Hacia, Desde, fill = Prob)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.3f", Prob)), size = 5) +
+  scale_fill_gradient(low = "#F7FBFF", high = "#2171B5", limits = c(0, 1)) +
+  scale_y_discrete(limits = rev(estados)) +
+  labs(title = sprintf("Matriz de transición empírica P_ij - %s", ticker),
+       x = "Estado siguiente (j)", y = "Estado actual (i)") +
+  theme_minimal(base_size = 12)
+print(g_heat)
+
+cat("\n>>> Fin del script. Modifica 'ticker' y las fechas en la sección 0 para otro activo.\n")
+
+```
+
