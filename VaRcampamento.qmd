@@ -1,0 +1,352 @@
+---
+title: "VaR Camp"
+format: html
+editor: visual
+---
+
+```{r}
+# 0. CONFIGURACIÓN 
+# Activos (tickers de Yahoo Finance)
+tickers <- c("ORCL", "UBER", "RDDT", "BABA", "OMAB", "AVGO", "SKWD", "RKLB", "NBIX", "KBR", "EXE")
+# Posición en valor monetario por activo (ej. MXN). Negativo = corto.
+posiciones <- c(
+  "ORCL" =  1000,
+  "UBER" =  1000,
+  "RDDT" =  1000,
+  "BABA" =  1000,
+  "OMAB" =  1000,
+  "AVGO" =  1000,
+  "SKWD" =  1000,
+  "RKLB" =  1000,
+  "NBIX" =  1000,
+  "KBR"  =  1000,
+  "EXE"  =  1000
+)
+
+fecha_inicio  <- "2022-01-01"
+fecha_fin     <- as.character(Sys.Date())
+
+confianza     <- 0.99        # 0.95 o 0.99
+horizonte     <- 1           # días (se escala con raíz del tiempo)
+tipo_rend     <- "simple"    # "simple" (% cambio) o "log"
+usar_ewma     <- FALSE       # TRUE = ponderación exponencial
+lambda_ewma   <- 0.94        # factor RiskMetrics para datos diarios
+n_sim         <- 100000      # simulaciones Monte Carlo
+ventana_bt    <- 250         # ventana (días) para backtesting
+set.seed(123)
+
+# 1. PAQUETES 
+paquetes <- c("quantmod", "xts", "zoo")
+for (p in paquetes) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+}
+
+# 2. DATOS Y RENDIMIENTOS 
+cat("Descargando precios...\n")
+lista_precios <- lapply(tickers, function(tk) {
+  Ad(getSymbols(tk, src = "yahoo", from = fecha_inicio, to = fecha_fin,
+                auto.assign = FALSE))
+})
+precios <- do.call(merge, lista_precios)
+colnames(precios) <- tickers
+precios <- na.omit(precios)            # solo días con datos de todos los activos
+
+# Por qué rendimientos y no niveles: los precios siguen un paseo aleatorio no
+# acotado; los rendimientos tienen una distribución estable y "con forma de campana".
+retornos <- if (tipo_rend == "log") diff(log(precios)) else precios / lag(precios, 1) - 1
+retornos <- na.omit(retornos)
+R <- coredata(retornos)                # matriz T x k
+
+# Prueba de calidad de datos (bad data): rendimientos extremos (> 5 desv. est.)
+extremos <- which(abs(scale(R)) > 5, arr.ind = TRUE)
+if (nrow(extremos) > 0) {
+  cat("AVISO: hay", nrow(extremos), "rendimientos > 5 desv. est. Revisa posibles datos erróneos.\n")
+}
+
+pos <- posiciones[tickers]             # asegura el mismo orden que las columnas
+z   <- qnorm(confianza)                # 2.33 para 99%, 1.64 para 95%
+esc <- sqrt(horizonte)                 # escalamiento por horizonte
+
+# 3. VaR DE UN SOLO ACTIVO 
+sigma_i <- apply(R, 2, sd)
+var_individual <- abs(pos) * z * sigma_i * esc
+
+cat("\n VaR INDIVIDUAL (", confianza * 100, "%, ", horizonte, " día(s)) \n", sep = "")
+print(round(data.frame(Posicion = pos, Vol_diaria = sigma_i, VaR = var_individual), 4))
+
+# 4. VaR DE UN BONO (basado en yield / DV01) 
+# Fórmula de la lectura: VaR = posición * DV01 * yield * vol_relativa_yield * z * 100
+
+var_bono <- function(posicion, dv01_por_100, yield_pct, vol_rel_yield, z) {
+  posicion * dv01_por_100 * yield_pct * vol_rel_yield * z * 100
+}
+ejemplo_bono <- var_bono(100, 0.07923, 4.644, 0.01312, 2.33) / 100
+cat("\nEjemplo bono UST 10y (lectura): VaR =", round(ejemplo_bono * 100, 4), "\n")
+
+# 5. VARIANZA-COVARIANZA 
+cov_ewma <- function(R, lambda = 0.94) {
+  n  <- nrow(R)
+  w  <- lambda^((n - 1):0)            # más peso a lo reciente
+  w  <- w / sum(w)
+  mu <- colSums(R * w)
+  Rc <- sweep(R, 2, mu)
+  t(Rc * w) %*% Rc
+}
+S <- if (usar_ewma) cov_ewma(R, lambda_ewma) else cov(R)
+dimnames(S) <- list(tickers, tickers)
+
+var_port   <- as.numeric(t(pos) %*% S %*% pos)
+sd_port    <- sqrt(var_port)
+VaR_vcov   <- z * sd_port * esc
+
+VaR_suma_individual <- sum(var_individual)
+cat("\n- VARIANZA-COVARIANZA -\n")
+cat("Volatilidad del portafolio ($):", round(sd_port, 2), "\n")
+cat("VaR portafolio:                ", round(VaR_vcov, 2), "\n")
+cat("Suma de VaR individuales:      ", round(VaR_suma_individual, 2), "\n")
+cat("Beneficio de diversificación:  ", round(VaR_suma_individual - VaR_vcov, 2), "\n")
+
+cat("\nMatriz de correlación:\n")
+print(round(cov2cor(S), 2))
+
+# 6. VaR ABSOLUTO, MARGINAL Y COMPONENTE
+var_vcov_fn <- function(p) z * sqrt(as.numeric(t(p) %*% S %*% p)) * esc
+
+var_absoluto <- sapply(seq_along(pos), function(i) {
+  p <- rep(0, length(pos)); p[i] <- pos[i]; var_vcov_fn(p)
+})
+var_marginal <- sapply(seq_along(pos), function(i) {
+  p <- pos; p[i] <- 0; VaR_vcov - var_vcov_fn(p)
+})
+cov_con_port   <- as.numeric(S %*% pos)
+var_componente <- pos * cov_con_port / var_port * VaR_vcov
+
+tabla_contrib <- data.frame(
+  Activo      = tickers,
+  Posicion    = as.numeric(pos),
+  VaR_Abs     = var_absoluto,
+  VaR_Marg    = var_marginal,
+  VaR_Comp    = var_componente,
+  Pct_Riesgo  = 100 * var_componente / VaR_vcov
+)
+cat("\n -CONTRIBUCIÓN AL RIESGO (dónde está el riesgo)- \n")
+print(round(tabla_contrib[, -1], 2), row.names = FALSE)
+cat("Suma VaR componente =", round(sum(var_componente), 2), "(= VaR total)\n")
+cat("Un VaR marginal negativo indica que el activo funciona como cobertura natural.\n")
+
+# 7. SIMULACIÓN HISTÓRICA 
+pnl_hist <- as.numeric(R %*% pos)
+alpha    <- 1 - confianza
+VaR_hist <- -quantile(pnl_hist, alpha, names = FALSE) * esc
+ES_hist  <- -mean(pnl_hist[pnl_hist <= quantile(pnl_hist, alpha)]) * esc
+
+cat("\n -SIMULACIÓN HISTÓRICA- \n")
+cat("Observaciones:", length(pnl_hist), "\n")
+cat("VaR histórico:", round(VaR_hist, 2), "\n")
+cat("Expected Shortfall (pérdida promedio más allá del VaR):", round(ES_hist, 2), "\n")
+
+peor_dia <- which.min(pnl_hist)
+cat("Peor día histórico:", as.character(index(retornos)[peor_dia]),
+    "| P&L:", round(pnl_hist[peor_dia], 2), "\n")
+print(round(R[peor_dia, ] * pos, 2))
+
+# 8. SIMULACIÓN MONTE CARLO 
+montecarlo_chol <- function(S, n_sim) {
+  L  <- t(chol(S))
+  Zs <- matrix(rnorm(n_sim * ncol(S)), nrow = n_sim)
+  Zs %*% t(L)
+}
+montecarlo_eigen <- function(S, n_sim) {
+  ev <- eigen(S, symmetric = TRUE)
+  vals <- pmax(ev$values, 0)
+  Zs <- matrix(rnorm(n_sim * ncol(S)), nrow = n_sim)
+  Zs %*% diag(sqrt(vals)) %*% t(ev$vectors)
+}
+
+shocks <- tryCatch(montecarlo_chol(S, n_sim),
+                   error = function(e) {
+                     cat("Cholesky falló (matriz no definida positiva). Usando eigen.\n")
+                     montecarlo_eigen(S, n_sim)
+                   })
+
+cat("\nError máximo entre S simulada y S original:",
+    signif(max(abs(cov(shocks) - S)), 3), "\n")
+
+pnl_mc <- as.numeric(shocks %*% pos)
+VaR_mc <- -quantile(pnl_mc, alpha, names = FALSE) * esc
+
+cat("\n -MONTE CARLO- (", format(n_sim, big.mark = ","), " simulaciones) \n", sep = "")
+cat("VaR Monte Carlo:", round(VaR_mc, 2), "\n")
+# 9. COMPARACIÓN DE MÉTODOS 
+resumen <- data.frame(
+  Metodo = c("Varianza-Covarianza", "Simulación Histórica", "Monte Carlo"),
+  VaR    = round(c(VaR_vcov, VaR_hist, VaR_mc), 2)
+)
+resumen$Pct_Portafolio <- round(100 * resumen$VaR / sum(abs(pos)), 2)
+cat("\n RESUMEN \n")
+print(resumen, row.names = FALSE)
+# 10. BACKTESTING 
+backtest <- function(R, pos, ventana, z, usar_ewma, lambda) {
+  n <- nrow(R)
+  var_t <- rep(NA_real_, n)
+  for (t in (ventana + 1):n) {
+    Rv <- R[(t - ventana):(t - 1), , drop = FALSE]
+    Sv <- if (usar_ewma) cov_ewma(Rv, lambda) else cov(Rv)
+    var_t[t] <- z * sqrt(as.numeric(t(pos) %*% Sv %*% pos))
+  }
+  pnl <- as.numeric(R %*% pos)
+  list(var = var_t, pnl = pnl, exc = pnl < -var_t)
+}
+
+kupiec <- function(x, N, p) {
+  ph <- x / N
+  ll0 <- (N - x) * log(1 - p) + x * log(p)
+  ll1 <- ifelse(x == 0, N * log(1 - ph),
+         ifelse(x == N, N * log(ph),
+                (N - x) * log(1 - ph) + x * log(ph)))
+  LR <- -2 * (ll0 - ll1)
+  c(LR = LR, p_valor = 1 - pchisq(LR, 1))
+}
+
+if (nrow(R) > ventana_bt + 30) {
+  bt <- backtest(R, pos, ventana_bt, z, usar_ewma, lambda_ewma)
+  ok <- !is.na(bt$var)
+  N  <- sum(ok); x <- sum(bt$exc[ok])
+  k  <- kupiec(x, N, alpha)
+  cat("\n BACKTESTING \n")
+  cat("Días evaluados:", N, "| Excepciones:", x,
+      "| Esperadas:", round(N * alpha, 1), "\n")
+  cat("Kupiec LR =", round(k["LR"], 3), "| p-valor =", round(k["p_valor"], 3),
+      ifelse(k["p_valor"] < 0.05, "-> modelo RECHAZADO", "-> modelo aceptable"), "\n")
+} else {
+  bt <- NULL
+  cat("\nNo hay suficientes datos para backtesting con ventana", ventana_bt, "\n")
+}
+# 11. GRÁFICAS 
+op <- par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+hist(pnl_hist, breaks = 50, col = "grey85", border = "white",
+     main = "P&L histórico y VaR", xlab = "P&L ($)")
+abline(v = -VaR_hist, col = "red", lwd = 2)
+abline(v = -VaR_vcov, col = "blue", lwd = 2, lty = 2)
+legend("topleft", c("VaR Hist.", "VaR Var-Cov"), col = c("red", "blue"),
+       lty = c(1, 2), lwd = 2, bty = "n", cex = 0.8)
+
+hist(pnl_mc, breaks = 80, col = "lightblue", border = "white",
+     main = "P&L Monte Carlo", xlab = "P&L ($)")
+abline(v = -VaR_mc, col = "red", lwd = 2)
+
+barplot(tabla_contrib$VaR_Comp, names.arg = tickers, las = 2, col = "steelblue",
+        main = "VaR componente por activo", ylab = "$")
+abline(h = 0)
+
+if (!is.null(bt)) {
+  fechas <- index(retornos)
+  plot(fechas, bt$pnl, type = "h", col = "grey60",
+       main = "Backtest: P&L vs -VaR", xlab = "", ylab = "$")
+  lines(fechas, -bt$var, col = "red", lwd = 1.5)
+  puntos <- which(bt$exc)
+  points(fechas[puntos], bt$pnl[puntos], pch = 19, col = "red", cex = 0.7)
+}
+par(op)
+# 11b. VISUALIZACIÓN DE LA SIMULACIÓN MONTE CARLO 
+# Figura A (2x2): distribución simulada, trayectorias, comparación de métodos, QQ
+# Figura B: shocks simulados vs rendimientos históricos (verifica correlaciones)
+dias_trayectoria <- 20      # días hacia adelante en el gráfico de trayectorias
+n_trayectorias   <- 200     # número de trayectorias simuladas a dibujar
+
+q_mc  <- quantile(pnl_mc, alpha, names = FALSE)             # cuantil a 1 día
+es_mc <- mean(pnl_mc[pnl_mc <= q_mc])                        # Expected Shortfall a 1 día
+# Trayectorias: P&L diario simulado con la misma covarianza, acumulado día a día
+sim_fn <- function(n) tryCatch(montecarlo_chol(S, n), error = function(e) montecarlo_eigen(S, n))
+pnl_dia <- matrix(as.numeric(sim_fn(dias_trayectoria * n_trayectorias) %*% pos),
+                  nrow = dias_trayectoria)
+trayectorias <- apply(pnl_dia, 2, cumsum)                    # P&L acumulado (aprox. sin capitalizar)
+bandas <- apply(trayectorias, 1, quantile,
+                probs = c(alpha, 0.05, 0.50, 0.95, 1 - alpha))
+envolvente_var <- -z * sd_port * sqrt(1:dias_trayectoria)    # -VaR teórico por horizonte
+
+op <- par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+# (A1) Distribución simulada con cola sombreada, VaR y ES
+d <- density(pnl_mc)
+plot(d, main = "Monte Carlo: distribución del P&L (1 día)",
+     xlab = "P&L ($)", ylab = "Densidad", lwd = 2, col = "steelblue")
+cola <- d$x <= q_mc
+polygon(c(d$x[cola], q_mc), c(d$y[cola], 0), col = rgb(1, 0, 0, 0.35), border = NA)
+curve(dnorm(x, mean(pnl_mc), sd(pnl_mc)), add = TRUE, col = "darkgreen", lty = 2, lwd = 1.5)
+abline(v = q_mc,  col = "red",    lwd = 2)
+abline(v = es_mc, col = "orange", lwd = 2, lty = 3)
+legend("topleft", bty = "n", cex = 0.75, lwd = c(2, 1.5, 2, 2),
+       lty = c(1, 2, 1, 3), col = c("steelblue", "darkgreen", "red", "orange"),
+       legend = c("Densidad simulada", "Normal teórica",
+                  paste0("VaR ", confianza * 100, "%: ", round(-q_mc, 0)),
+                  paste0("ES: ", round(-es_mc, 0))))
+# (A2) Trayectorias simuladas con bandas de percentiles
+matplot(1:dias_trayectoria, trayectorias, type = "l", lty = 1,
+        col = rgb(0.4, 0.4, 0.4, 0.15), xlab = "Días", ylab = "P&L acumulado ($)",
+        main = paste0("Monte Carlo: ", n_trayectorias, " trayectorias a ",
+                      dias_trayectoria, " días"))
+lines(1:dias_trayectoria, bandas[3, ], col = "black", lwd = 2)                  # mediana
+lines(1:dias_trayectoria, bandas[2, ], col = "blue",  lwd = 2, lty = 2)         # 5%
+lines(1:dias_trayectoria, bandas[4, ], col = "blue",  lwd = 2, lty = 2)         # 95%
+lines(1:dias_trayectoria, bandas[1, ], col = "red",   lwd = 2)                  # alpha
+lines(1:dias_trayectoria, envolvente_var, col = "darkred", lwd = 2, lty = 3)    # -VaR teórico
+abline(h = 0, col = "grey40")
+legend("topleft", bty = "n", cex = 0.7, lwd = 2, lty = c(1, 2, 1, 3),
+       col = c("black", "blue", "red", "darkred"),
+       legend = c("Mediana", "Percentiles 5% / 95%",
+                  paste0("Percentil ", alpha * 100, "%"), "-VaR teórico (raíz del tiempo)"))
+# (A3) Comparación de las tres distribuciones
+d_h <- density(pnl_hist); d_m <- density(pnl_mc)
+xs  <- seq(min(d_h$x, d_m$x), max(d_h$x, d_m$x), length.out = 512)
+d_n <- dnorm(xs, 0, sd_port)
+plot(xs, d_n, type = "l", col = "blue", lwd = 2, lty = 2,
+     ylim = range(0, d_h$y, d_m$y, d_n), xlab = "P&L ($)", ylab = "Densidad",
+     main = "Comparación: Var-Cov vs Histórica vs Monte Carlo")
+lines(d_h, col = "grey30", lwd = 2)
+lines(d_m, col = "red",    lwd = 2)
+legend("topleft", bty = "n", cex = 0.75, lwd = 2, lty = c(2, 1, 1),
+       col = c("blue", "grey30", "red"),
+       legend = c("Var-Cov (normal)", "Histórica", "Monte Carlo"))
+
+# (A4) QQ-plot: Monte Carlo vs Histórica (diagnostica colas gruesas)
+probs <- seq(0.001, 0.999, length.out = 500)
+qh <- quantile(pnl_hist, probs); qm <- quantile(pnl_mc, probs)
+plot(qm, qh, pch = 16, cex = 0.5, col = "steelblue",
+     xlab = "Cuantiles Monte Carlo ($)", ylab = "Cuantiles Históricos ($)",
+     main = "QQ-plot: Monte Carlo vs Histórica")
+abline(0, 1, col = "red", lwd = 2)
+mtext("Puntos fuera de la línea en los extremos = colas más gruesas que la normal",
+      side = 1, line = 3, cex = 0.6)
+par(op)
+
+# Guardar la Figura A
+dev.copy(png, filename = "VaR_montecarlo_figA.png", width = 1600, height = 1200, res = 140)
+invisible(dev.off())
+# (B) Shocks simulados vs rendimientos históricos de los 2 activos más grandes
+idx  <- order(abs(pos), decreasing = TRUE)[1:2]
+ns   <- min(3000, n_sim)
+filas <- sample(nrow(shocks), ns)
+plot(R[, idx[1]], R[, idx[2]], pch = 16, cex = 0.6, col = rgb(0.2, 0.2, 0.2, 0.6),
+     xlab = paste("Rendimiento", tickers[idx[1]]),
+     ylab = paste("Rendimiento", tickers[idx[2]]),
+     main = "Shocks simulados vs rendimientos históricos")
+points(shocks[filas, idx[1]], shocks[filas, idx[2]], pch = 16, cex = 0.4,
+       col = rgb(0, 0.3, 1, 0.15))
+abline(h = 0, v = 0, col = "grey60")
+legend("topleft", bty = "n", pch = 16, cex = 0.8,
+       col = c(rgb(0.2, 0.2, 0.2, 0.6), rgb(0, 0.3, 1, 0.6)),
+       legend = c(paste0("Histórico (correl. ", round(cor(R[, idx[1]], R[, idx[2]]), 2), ")"),
+                  paste0("Simulado (correl. ", round(cor(shocks[, idx[1]], shocks[, idx[2]]), 2), ")")))
+
+dev.copy(png, filename = "VaR_montecarlo_figB.png", width = 1200, height = 1000, res = 140)
+invisible(dev.off())
+# 12. EXPORTAR RESULTADOS 
+write.csv(tabla_contrib, "VaR_contribucion_por_activo.csv", row.names = FALSE)
+write.csv(resumen, "VaR_resumen_metodos.csv", row.names = FALSE)
+cat("\nArchivos guardados: VaR_contribucion_por_activo.csv, VaR_resumen_metodos.csv\n")
+```
+
+
+
